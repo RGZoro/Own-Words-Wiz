@@ -1,0 +1,340 @@
+import { GameState, StudentResponse, NetworkMessage } from '../types';
+import { Peer, DataConnection } from 'peerjs';
+
+const STORAGE_KEY = 'own_words_wiz_state';
+const APP_PREFIX = 'oww-v1-';
+
+// Initial state
+const initialState: GameState = {
+  prompt: '',
+  maxScore: 2,
+  isAcceptingAnswers: false,
+  students: {},
+  projectorDisplay: { type: 'prompt' },
+};
+
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'offline_mode';
+
+/**
+ * GameService handles the game logic and networking.
+ * It supports both LocalStorage (for same-device tabs) and PeerJS (for cross-device).
+ */
+class GameService {
+  private state: GameState;
+  private listeners: ((state: GameState) => void)[] = [];
+  
+  // PeerJS
+  private peer: Peer | null = null;
+  private connections: DataConnection[] = [];
+  private isHost: boolean = false;
+  public connectionStatus: ConnectionStatus = 'disconnected';
+
+  constructor() {
+    // Try to load state from local storage for persistence across reloads (Teacher only)
+    const saved = localStorage.getItem(STORAGE_KEY);
+    this.state = saved ? JSON.parse(saved) : initialState;
+
+    // Listener for local tab sync (legacy/backup support)
+    window.addEventListener('storage', (e) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        // Only merge if we are not the host, or if we are just starting up
+        if (!this.isHost) {
+           this.state = JSON.parse(e.newValue);
+           this.notifyListeners();
+        }
+      }
+    });
+  }
+
+  public getState(): GameState {
+    return this.state;
+  }
+
+  public subscribe(callback: (state: GameState) => void): () => void {
+    this.listeners.push(callback);
+    callback(this.state);
+    return () => {
+      this.listeners = this.listeners.filter((l) => l !== callback);
+    };
+  }
+
+  private persist() {
+    // Save to local storage
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+    
+    // Broadcast to peers if we are host
+    if (this.isHost) {
+      this.broadcast({ type: 'SYNC_STATE', payload: this.state });
+    }
+    
+    this.notifyListeners();
+  }
+
+  private notifyListeners() {
+    // We send a shallow copy, but state mutations should generally be immutable for React
+    const stateCopy = { ...this.state };
+    this.listeners.forEach((l) => l(stateCopy));
+  }
+
+  private broadcast(msg: NetworkMessage) {
+    this.connections.forEach(conn => {
+      if (conn.open) {
+        conn.send(msg);
+      }
+    });
+  }
+
+  // --- Networking: Teacher (Host) ---
+
+  public async startHosting(): Promise<string> {
+    this.isHost = true;
+    this.connectionStatus = 'connecting';
+    
+    // Reuse existing code if available, or generate new
+    const code = this.state.roomCode || Math.random().toString(36).substring(2, 6).toUpperCase();
+    const fullId = APP_PREFIX + code;
+    
+    // Update state immediately so UI shows the code
+    this.state = { ...this.state, roomCode: code };
+    this.persist();
+
+    return new Promise((resolve) => {
+      try {
+        if (this.peer) this.peer.destroy();
+
+        // 5 Second Timeout fallback
+        const timeoutId = setTimeout(() => {
+          console.warn("PeerJS initialization timed out. Switching to Offline Mode.");
+          this.connectionStatus = 'offline_mode';
+          this.peer = null;
+          resolve(code); 
+        }, 5000);
+
+        this.peer = new Peer(fullId, {
+            debug: 1,
+            secure: true
+        });
+
+        this.peer.on('open', (id) => {
+          clearTimeout(timeoutId);
+          console.log('Host initialized:', id);
+          this.connectionStatus = 'connected';
+          resolve(code);
+        });
+
+        this.peer.on('connection', (conn) => {
+          console.log('New student connected:', conn.peer);
+          this.connections.push(conn);
+          
+          conn.on('open', () => {
+             // Send current state immediately upon connection
+             conn.send({ type: 'SYNC_STATE', payload: this.state });
+          });
+
+          conn.on('data', (data: any) => {
+            this.handleMessage(data);
+          });
+          
+          conn.on('close', () => {
+             this.connections = this.connections.filter(c => c !== conn);
+          });
+        });
+
+        this.peer.on('error', (err) => {
+          clearTimeout(timeoutId);
+          console.error('Peer error:', err);
+          
+          if (err.type === 'unavailable-id') {
+             // If ID is taken, we might want to try a new code, but for now we fallback
+             // Real app might regen code here
+          }
+          
+          // Fallback to offline mode on critical error
+          this.connectionStatus = 'offline_mode';
+          resolve(code);
+        });
+
+      } catch (e) {
+        console.error("PeerJS exception:", e);
+        this.connectionStatus = 'offline_mode';
+        resolve(code);
+      }
+    });
+  }
+
+  // --- Networking: Student (Client) ---
+
+  public async joinGame(code: string, studentName: string): Promise<boolean> {
+    this.isHost = false;
+    const fullId = APP_PREFIX + code.toUpperCase();
+
+    return new Promise((resolve, reject) => {
+      try {
+          if (this.peer) this.peer.destroy();
+          
+          const peer = new Peer();
+          
+          peer.on('open', () => {
+            const conn = peer.connect(fullId, { reliable: true });
+            
+            conn.on('open', () => {
+              console.log('Connected to teacher');
+              this.peer = peer;
+              this.connections = [conn];
+              resolve(true);
+            });
+
+            conn.on('data', (data: any) => {
+              const msg = data as NetworkMessage;
+              if (msg.type === 'SYNC_STATE') {
+                this.state = msg.payload;
+                this.notifyListeners();
+              }
+            });
+
+            conn.on('error', (err) => {
+              console.error("Connection Peer Error:", err);
+              reject(err);
+            });
+            
+            // Timeout handling
+            setTimeout(() => {
+              if (!conn.open) reject(new Error("Connection timed out. Check code."));
+            }, 5000);
+          });
+
+          peer.on('error', (err) => {
+            console.error("Client Peer Error:", err);
+            reject(err);
+          });
+      } catch (e) {
+          reject(e);
+      }
+    });
+  }
+
+  private handleMessage(msg: NetworkMessage) {
+    if (!this.isHost) return;
+
+    if (msg.type === 'SUBMIT_ANSWER') {
+      const { name, text } = msg.payload;
+      this.addAnswerInternal(name, text);
+    }
+  }
+
+  // --- Actions ---
+
+  // Called by Student View
+  public sendAnswer(studentName: string, text: string) {
+    if (this.isHost) {
+       // If testing locally as host
+       this.addAnswerInternal(studentName, text);
+    } else {
+       // Send to host
+       if (this.connections[0]?.open) {
+         this.connections[0].send({ type: 'SUBMIT_ANSWER', payload: { name: studentName, text } });
+       }
+    }
+  }
+
+  // Internal Logic
+  private addAnswerInternal(studentName: string, text: string) {
+    const id = studentName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
+    const response: StudentResponse = {
+      id,
+      studentName,
+      text,
+      submittedAt: Date.now(),
+      score: null,
+    };
+    // Immutable update
+    this.state = {
+      ...this.state,
+      students: { ...this.state.students, [id]: response }
+    };
+    this.persist();
+    return id;
+  }
+
+  // Teacher Actions
+  public setPrompt(prompt: string, maxScore: number = 2) {
+    this.state = {
+        ...this.state,
+        prompt,
+        maxScore,
+        isAcceptingAnswers: true,
+        students: {},
+        projectorDisplay: { type: 'prompt' }
+    };
+    this.persist();
+  }
+
+  public toggleAccepting(accepting: boolean) {
+    this.state = { ...this.state, isAcceptingAnswers: accepting };
+    this.persist();
+  }
+
+  public setProjectorView(type: 'prompt' | 'answer', answerId?: string) {
+    this.state = { 
+        ...this.state, 
+        projectorDisplay: { type, contentId: answerId } 
+    };
+    this.persist();
+  }
+
+  public updateStudentScore(id: string, score: number) {
+    if (this.state.students[id]) {
+      this.state = {
+          ...this.state,
+          students: {
+              ...this.state.students,
+              [id]: { ...this.state.students[id], score }
+          }
+      };
+      this.persist();
+    }
+  }
+
+  public updateStudentAiData(id: string, score: number, feedback: string) {
+    if (this.state.students[id]) {
+       this.state = {
+          ...this.state,
+          students: {
+              ...this.state.students,
+              [id]: { ...this.state.students[id], aiSuggestedScore: score, aiFeedback: feedback }
+          }
+       };
+      this.persist();
+    }
+  }
+  
+  public addDemoStudents() {
+    if (!this.state.prompt) {
+      this.setPrompt("Explain how the writer conveys the intensity of the storm.", 2);
+    }
+
+    const demos = [
+      { name: "Sarah J.", text: "The writer conveys the intensity by using the word 'battered' to describe the wind against the walls." },
+      { name: "Mike T.", text: "It was very windy and loud outside." },
+      { name: "David L.", text: "The text says 'the wind battered the walls' which shows it was strong." },
+      { name: "Emma W.", text: "By using the metaphor of a 'wild beast', the writer suggests the storm was uncontrollable." }
+    ];
+
+    demos.forEach((d) => {
+      this.addAnswerInternal(d.name, d.text);
+    });
+  }
+
+  public resetGame() {
+    const code = this.state.roomCode; 
+    // Reset but keep connection info
+    this.state = { 
+        ...initialState, 
+        roomCode: code, 
+        students: {} 
+    };
+    this.persist();
+  }
+}
+
+export const backend = new GameService();
