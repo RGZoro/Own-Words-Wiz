@@ -22,6 +22,12 @@ export interface GameState {
   };
 }
 
+export interface LogEntry {
+  timestamp: string;
+  type: 'info' | 'error' | 'success';
+  message: string;
+}
+
 // Network Message Types
 export type NetworkMessage = 
   | { type: 'SYNC_STATE'; payload: GameState }

@@ -1,4 +1,4 @@
-import { GameState, StudentResponse, NetworkMessage } from '../types';
+import { GameState, StudentResponse, NetworkMessage, LogEntry } from '../types';
 import { Peer, DataConnection } from 'peerjs';
 
 const STORAGE_KEY = 'own_words_wiz_state';
@@ -13,7 +13,7 @@ const initialState: GameState = {
   projectorDisplay: { type: 'prompt' },
 };
 
-export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'offline_mode';
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 /**
  * GameService handles the game logic and networking.
@@ -22,12 +22,14 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'of
 class GameService {
   private state: GameState;
   private listeners: ((state: GameState) => void)[] = [];
+  private logListeners: ((logs: LogEntry[]) => void)[] = [];
   
   // PeerJS
   private peer: Peer | null = null;
   private connections: DataConnection[] = [];
   private isHost: boolean = false;
   public connectionStatus: ConnectionStatus = 'disconnected';
+  private logs: LogEntry[] = [];
 
   constructor() {
     // Try to load state from local storage for persistence across reloads (Teacher only)
@@ -44,7 +46,39 @@ class GameService {
         }
       }
     });
+    
+    this.addLog('info', 'Service initialized');
   }
+
+  // --- Logging ---
+  private addLog(type: 'info' | 'error' | 'success', message: string) {
+    const entry: LogEntry = {
+      timestamp: new Date().toLocaleTimeString(),
+      type,
+      message
+    };
+    this.logs.unshift(entry); // Add to top
+    // Limit logs
+    if (this.logs.length > 100) this.logs = this.logs.slice(0, 100);
+    this.logListeners.forEach(l => l([...this.logs]));
+    
+    if (type === 'error') console.error(message);
+    else console.log(`[${type.toUpperCase()}] ${message}`);
+  }
+
+  public getLogs(): LogEntry[] {
+    return this.logs;
+  }
+
+  public subscribeLogs(callback: (logs: LogEntry[]) => void): () => void {
+    this.logListeners.push(callback);
+    callback([...this.logs]);
+    return () => {
+      this.logListeners = this.logListeners.filter(l => l !== callback);
+    };
+  }
+
+  // --- State Management ---
 
   public getState(): GameState {
     return this.state;
@@ -71,7 +105,7 @@ class GameService {
   }
 
   private notifyListeners() {
-    // We send a shallow copy, but state mutations should generally be immutable for React
+    // We send a shallow copy
     const stateCopy = { ...this.state };
     this.listeners.forEach((l) => l(stateCopy));
   }
@@ -87,6 +121,7 @@ class GameService {
   // --- Networking: Teacher (Host) ---
 
   public async startNewClass(): Promise<string> {
+    this.addLog('info', 'Starting new class...');
     // 1. Disconnect existing peer
     if (this.peer) {
       this.peer.destroy();
@@ -94,10 +129,10 @@ class GameService {
     }
     this.connections = [];
     
-    // 2. Clear room code in state so startHosting generates a new one
+    // 2. Clear room code in state
     this.state = {
       ...initialState,
-      roomCode: undefined, // Clear code
+      roomCode: undefined, 
     };
     this.persist();
 
@@ -108,58 +143,49 @@ class GameService {
   public async startHosting(): Promise<string> {
     this.isHost = true;
     this.connectionStatus = 'connecting';
+    this.addLog('info', 'Initializing Host...');
     
     // Reuse existing code if available, or generate new
     const code = this.state.roomCode || Math.random().toString(36).substring(2, 6).toUpperCase();
     const fullId = APP_PREFIX + code;
     
-    // Update state immediately so UI shows the code
     this.state = { ...this.state, roomCode: code };
     this.persist();
 
     return new Promise((resolve) => {
       try {
         if (this.peer && !this.peer.destroyed) {
-            console.log("Peer already exists, returning existing code");
+            this.addLog('info', 'Peer already active, reusing.');
             this.connectionStatus = 'connected';
             resolve(code);
             return;
         }
 
-        // 10 Second Timeout fallback (Increased from 5s)
-        const timeoutId = setTimeout(() => {
-          console.warn("PeerJS initialization timed out. Switching to Offline Mode.");
-          this.connectionStatus = 'offline_mode';
-          this.peer = null;
-          resolve(code); 
-        }, 10000);
-
+        // Force secure connection (true) and reliable cloud server
         this.peer = new Peer(fullId, {
             debug: 1,
-            // Explicitly use Google's STUN servers to improve connectivity on cellular/NATs
+            secure: true, 
             config: {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
                     { urls: 'stun:stun1.l.google.com:19302' },
                     { urls: 'stun:stun2.l.google.com:19302' },
-                    { urls: 'stun:stun3.l.google.com:19302' },
-                    { urls: 'stun:stun4.l.google.com:19302' }
                 ]
             }
         });
 
         this.peer.on('open', (id) => {
-          clearTimeout(timeoutId);
-          console.log('Host initialized:', id);
+          this.addLog('success', `Host Online. ID: ${id}`);
           this.connectionStatus = 'connected';
           resolve(code);
         });
 
         this.peer.on('connection', (conn) => {
-          console.log('New student connected:', conn.peer);
+          this.addLog('info', `Student connecting: ${conn.peer}`);
           this.connections.push(conn);
           
           conn.on('open', () => {
+             this.addLog('success', `Student joined: ${conn.peer}`);
              // Send current state immediately upon connection
              conn.send({ type: 'SYNC_STATE', payload: this.state });
           });
@@ -169,31 +195,39 @@ class GameService {
           });
           
           conn.on('close', () => {
+             this.addLog('info', `Student disconnected: ${conn.peer}`);
              this.connections = this.connections.filter(c => c !== conn);
+          });
+
+          conn.on('error', (err) => {
+             this.addLog('error', `Connection error with ${conn.peer}: ${err}`);
           });
         });
 
         this.peer.on('error', (err) => {
-          clearTimeout(timeoutId);
-          console.error('Peer error:', err);
+          this.addLog('error', `Host Peer Error: ${err.type} - ${err.message}`);
           
           if (err.type === 'unavailable-id') {
-             // If ID is taken, it usually means we refreshed the page. 
-             // We can assume we "own" it or the previous session is still zombie on the server.
-             // We mark as connected but might have issues if the old one is truly active.
+             this.addLog('info', 'ID taken, assuming session restoration.');
              this.connectionStatus = 'connected';
              resolve(code);
              return;
           }
           
-          // Fallback to offline mode on critical error
-          this.connectionStatus = 'offline_mode';
+          this.connectionStatus = 'error';
           resolve(code);
         });
 
-      } catch (e) {
-        console.error("PeerJS exception:", e);
-        this.connectionStatus = 'offline_mode';
+        this.peer.on('disconnected', () => {
+            this.addLog('error', 'Host disconnected from signaling server. Attempting reconnect...');
+            if (this.peer && !this.peer.destroyed) {
+                this.peer.reconnect();
+            }
+        });
+
+      } catch (e: any) {
+        this.addLog('error', `Exception in startHosting: ${e.message}`);
+        this.connectionStatus = 'error';
         resolve(code);
       }
     });
@@ -204,13 +238,14 @@ class GameService {
   public async joinGame(code: string, studentName: string): Promise<boolean> {
     this.isHost = false;
     const fullId = APP_PREFIX + code.toUpperCase();
+    this.addLog('info', `Attempting to join room: ${code}`);
 
     return new Promise((resolve, reject) => {
       try {
           if (this.peer) this.peer.destroy();
           
           const peer = new Peer({
-              // Add STUN servers for client as well
+              secure: true,
               config: {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
@@ -219,11 +254,12 @@ class GameService {
             }
           });
           
-          peer.on('open', () => {
+          peer.on('open', (id) => {
+            this.addLog('info', `Client Peer ID generated: ${id}`);
             const conn = peer.connect(fullId, { reliable: true });
             
             conn.on('open', () => {
-              console.log('Connected to teacher');
+              this.addLog('success', 'Connected to Teacher!');
               this.peer = peer;
               this.connections = [conn];
               resolve(true);
@@ -237,26 +273,33 @@ class GameService {
               }
             });
 
+            conn.on('close', () => {
+                this.addLog('error', 'Disconnected from Teacher.');
+            });
+
             conn.on('error', (err) => {
-              console.error("Connection Peer Error:", err);
-              // Don't reject immediately on transient errors
+              this.addLog('error', `Conn Error: ${err}`);
             });
             
-            // Timeout handling (Increased to 15s for cellular negotiation)
+            // 15s Timeout
             setTimeout(() => {
-              if (!conn.open) reject(new Error("Connection timed out. Check code or try different network."));
+              if (!conn.open) {
+                  this.addLog('error', 'Connection timed out.');
+                  reject(new Error("Connection timed out."));
+              }
             }, 15000);
           });
 
           peer.on('error', (err) => {
-            console.error("Client Peer Error:", err);
+            this.addLog('error', `Client Peer Error: ${err.type}`);
             if (err.type === 'peer-unavailable') {
                 reject(new Error("Class not found. Check code."));
             } else {
                 reject(err);
             }
           });
-      } catch (e) {
+      } catch (e: any) {
+          this.addLog('error', `Join Exception: ${e.message}`);
           reject(e);
       }
     });
@@ -267,6 +310,7 @@ class GameService {
 
     if (msg.type === 'SUBMIT_ANSWER') {
       const { name, text } = msg.payload;
+      this.addLog('info', `Received answer from ${name}`);
       this.addAnswerInternal(name, text);
     }
   }
@@ -276,12 +320,12 @@ class GameService {
   // Called by Student View
   public sendAnswer(studentName: string, text: string) {
     if (this.isHost) {
-       // If testing locally as host
        this.addAnswerInternal(studentName, text);
     } else {
-       // Send to host
        if (this.connections[0]?.open) {
          this.connections[0].send({ type: 'SUBMIT_ANSWER', payload: { name: studentName, text } });
+       } else {
+           this.addLog('error', 'Cannot send answer: Disconnected');
        }
     }
   }
@@ -312,10 +356,22 @@ class GameService {
         prompt,
         maxScore,
         isAcceptingAnswers: true,
-        students: {},
         projectorDisplay: { type: 'prompt' }
+        // Note: We do NOT clear students here intentionally, 
+        // to allow re-prompting if needed. Use resetRound() to clear.
     };
     this.persist();
+  }
+
+  public resetRound() {
+      this.addLog('info', 'Resetting round (clearing answers).');
+      this.state = {
+          ...this.state,
+          students: {},
+          isAcceptingAnswers: true,
+          projectorDisplay: { type: 'prompt' }
+      };
+      this.persist();
   }
 
   public toggleAccepting(accepting: boolean) {
@@ -358,10 +414,6 @@ class GameService {
   }
   
   public addDemoStudents() {
-    if (!this.state.prompt) {
-      this.setPrompt("Explain how the writer conveys the intensity of the storm.", 2);
-    }
-
     const demos = [
       { name: "Sarah J.", text: "The writer conveys the intensity by using the word 'battered' to describe the wind against the walls." },
       { name: "Mike T.", text: "It was very windy and loud outside." },
