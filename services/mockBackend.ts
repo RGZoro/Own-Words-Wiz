@@ -4,6 +4,16 @@ import { Peer, DataConnection } from 'peerjs';
 const STORAGE_KEY = 'own_words_wiz_state';
 const APP_PREFIX = 'oww-v1-';
 
+// Robust list of free STUN servers to help with Cellular/NAT traversal
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+  { urls: 'stun:stun4.l.google.com:19302' },
+  { urls: 'stun:global.stun.twilio.com:3478' }
+];
+
 // Initial state
 const initialState: GameState = {
   prompt: '',
@@ -17,7 +27,6 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 
 /**
  * GameService handles the game logic and networking.
- * It supports both LocalStorage (for same-device tabs) and PeerJS (for cross-device).
  */
 class GameService {
   private state: GameState;
@@ -59,7 +68,7 @@ class GameService {
     };
     this.logs.unshift(entry); // Add to top
     // Limit logs
-    if (this.logs.length > 100) this.logs = this.logs.slice(0, 100);
+    if (this.logs.length > 200) this.logs = this.logs.slice(0, 200);
     this.logListeners.forEach(l => l([...this.logs]));
     
     if (type === 'error') console.error(message);
@@ -161,17 +170,10 @@ class GameService {
             return;
         }
 
-        // Force secure connection (true) and reliable cloud server
         this.peer = new Peer(fullId, {
             debug: 1,
-            secure: true, 
-            config: {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' },
-                ]
-            }
+            secure: true,
+            config: { iceServers: ICE_SERVERS }
         });
 
         this.peer.on('open', (id) => {
@@ -182,10 +184,10 @@ class GameService {
 
         this.peer.on('connection', (conn) => {
           this.addLog('info', `Student connecting: ${conn.peer}`);
-          this.connections.push(conn);
           
           conn.on('open', () => {
              this.addLog('success', `Student joined: ${conn.peer}`);
+             this.connections.push(conn);
              // Send current state immediately upon connection
              conn.send({ type: 'SYNC_STATE', payload: this.state });
           });
@@ -246,22 +248,24 @@ class GameService {
           
           const peer = new Peer({
               secure: true,
-              config: {
-                iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' }
-                ]
-            }
+              config: { iceServers: ICE_SERVERS }
           });
           
           peer.on('open', (id) => {
-            this.addLog('info', `Client Peer ID generated: ${id}`);
-            const conn = peer.connect(fullId, { reliable: true });
+            this.addLog('info', `Client Peer ID generated. Connecting to ${fullId}...`);
+            
+            // Connect to host
+            const conn = peer.connect(fullId, { 
+                serialization: 'json',
+                metadata: { name: studentName }
+            });
             
             conn.on('open', () => {
               this.addLog('success', 'Connected to Teacher!');
               this.peer = peer;
               this.connections = [conn];
+              // Send join request immediately
+              conn.send({ type: 'JOIN_REQUEST', payload: { name: studentName } });
               resolve(true);
             });
 
@@ -281,13 +285,13 @@ class GameService {
               this.addLog('error', `Conn Error: ${err}`);
             });
             
-            // 15s Timeout
+            // Timeout safety
             setTimeout(() => {
               if (!conn.open) {
-                  this.addLog('error', 'Connection timed out.');
+                  this.addLog('error', 'Connection timed out. Firewalls may be blocking P2P.');
                   reject(new Error("Connection timed out."));
               }
-            }, 15000);
+            }, 10000);
           });
 
           peer.on('error', (err) => {
@@ -357,8 +361,6 @@ class GameService {
         maxScore,
         isAcceptingAnswers: true,
         projectorDisplay: { type: 'prompt' }
-        // Note: We do NOT clear students here intentionally, 
-        // to allow re-prompting if needed. Use resetRound() to clear.
     };
     this.persist();
   }
@@ -367,7 +369,7 @@ class GameService {
       this.addLog('info', 'Resetting round (clearing answers).');
       this.state = {
           ...this.state,
-          students: {},
+          students: {}, // Clear all answers
           isAcceptingAnswers: true,
           projectorDisplay: { type: 'prompt' }
       };
@@ -428,7 +430,6 @@ class GameService {
 
   public resetGame() {
     const code = this.state.roomCode; 
-    // Reset but keep connection info
     this.state = { 
         ...initialState, 
         roomCode: code, 

@@ -72,6 +72,7 @@ export const TeacherDashboard: React.FC = () => {
     const height = 768;
     const left = (window.screen.width - width) / 2;
     const top = (window.screen.height - height) / 2;
+    // Use URL API to safely append hash
     const url = new URL(window.location.href);
     url.hash = 'projector';
     window.open(url.toString(), 'ProjectorView', `width=${width},height=${height},left=${left},top=${top},menubar=no,toolbar=no,location=no,status=no`);
@@ -85,13 +86,13 @@ export const TeacherDashboard: React.FC = () => {
   };
 
   const handleResetRound = () => {
-      if (confirm("Clear all student answers for a new round? (Students stay connected)")) {
+      if (confirm("Reset Round: This will clear ALL student answers. Students will see a blank input box. Continue?")) {
           backend.resetRound();
       }
   };
 
   const handleNewClass = async () => {
-      if (confirm("WARNING: This will kick all students and generate a new code. Continue?")) {
+      if (confirm("New Class: This will DISCONNECT all students and create a new room code. Continue?")) {
           setIsResetting(true);
           await backend.startNewClass();
           setIsResetting(false);
@@ -136,9 +137,12 @@ export const TeacherDashboard: React.FC = () => {
                 )}
                 </div>
                 {connectionStatus === 'error' && (
-                    <span className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded border border-red-200 animate-pulse">
-                        ⚠ Connection Error
-                    </span>
+                    <button 
+                      onClick={() => setShowLogs(true)}
+                      className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded border border-red-200 animate-pulse hover:bg-red-200"
+                    >
+                        ⚠ Connection Error (Click for Logs)
+                    </button>
                 )}
             </div>
           </div>
@@ -203,12 +207,12 @@ export const TeacherDashboard: React.FC = () => {
             <h2 className="text-2xl font-bold text-gray-900 mb-4">Teacher Guide</h2>
             <div className="space-y-4 text-gray-600 overflow-y-auto max-h-[60vh]">
               <div className="bg-indigo-50 p-4 rounded-lg">
-                <h3 className="font-bold text-indigo-700 mb-2">Connectivity</h3>
-                <p className="text-sm">If students cannot join:</p>
+                <h3 className="font-bold text-indigo-700 mb-2">Connecting Students</h3>
+                <p className="text-sm">This app uses Peer-to-Peer technology to keep it free.</p>
                 <ul className="list-disc ml-5 text-sm mt-2">
-                   <li>Ensure both devices are on the same WiFi if possible.</li>
-                   <li>Check the <strong>Logs</strong> button below for errors.</li>
-                   <li>Some school firewalls block P2P. Try using a mobile hotspot.</li>
+                   <li>If students cannot join, click <strong>"New Class"</strong> to reset the server.</li>
+                   <li>Connecting across Cellular (4G/5G) and WiFi works, but sometimes school firewalls block it.</li>
+                   <li>Check the logs if issues persist.</li>
                 </ul>
               </div>
               <div className="mt-4 pt-4 border-t">
@@ -256,33 +260,34 @@ export const TeacherDashboard: React.FC = () => {
                
                <div className="flex flex-col gap-2">
                   <h3 className="text-xs font-bold text-gray-500 uppercase">Session Management</h3>
-                  <div className="flex gap-2">
-                     <Button 
-                       variant="secondary" 
-                       onClick={handleResetRound} 
-                       className="flex-1 text-sm bg-yellow-50 hover:bg-yellow-100 border-yellow-200 text-yellow-800"
-                     >
-                        Reset Round
-                     </Button>
-                     <Button 
-                       variant="danger" 
-                       onClick={handleNewClass} 
-                       disabled={isResetting} 
-                       className="flex-1 text-sm"
-                     >
-                        New Class
-                     </Button>
-                  </div>
-                  <p className="text-xs text-gray-400">
-                    <strong>Reset Round:</strong> Clears answers, keeps students connected.<br/>
-                    <strong>New Class:</strong> Kicks everyone, new code.
-                  </p>
+                  
+                  {/* Distinct Reset Buttons */}
+                  <Button 
+                    variant="secondary" 
+                    onClick={handleResetRound} 
+                    className="w-full justify-center text-sm border-orange-200 text-orange-800 bg-orange-50 hover:bg-orange-100"
+                  >
+                     Reset Round (Clear Answers)
+                  </Button>
+                  
+                  <Button 
+                    variant="danger" 
+                    onClick={handleNewClass} 
+                    disabled={isResetting} 
+                    className="w-full justify-center text-sm"
+                  >
+                     New Class (New Code)
+                  </Button>
                </div>
                
                <div className="pt-2">
                   <Button variant="ghost" onClick={() => backend.addDemoStudents()} className="w-full text-xs text-indigo-400">
                     + Add Demo Students
                   </Button>
+               </div>
+               
+               <div className="pt-2 text-center">
+                  <button onClick={() => setShowLogs(true)} className="text-xs text-gray-400 underline">System Logs</button>
                </div>
             </div>
           </div>
