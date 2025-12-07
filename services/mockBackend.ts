@@ -4,14 +4,11 @@ import { Peer, DataConnection } from 'peerjs';
 const STORAGE_KEY = 'own_words_wiz_state';
 const APP_PREFIX = 'oww-v1-';
 
-// Robust list of free STUN servers to help with Cellular/NAT traversal
+// Simplified STUN list. Too many servers causes timeouts on mobile.
+// Google's STUN servers are the gold standard for free reliability.
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
-  { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
-  { urls: 'stun:stun4.l.google.com:19302' },
-  { urls: 'stun:global.stun.twilio.com:3478' }
+  { urls: 'stun:stun1.l.google.com:19302' }
 ];
 
 // Initial state
@@ -57,7 +54,7 @@ class GameService {
       }
     });
     
-    this.addLog('info', 'Service initialized');
+    this.addLog('info', 'Service initialized (v1.0.1)');
   }
 
   // --- Logging ---
@@ -155,13 +152,12 @@ class GameService {
   private startHeartbeat() {
     this.stopHeartbeat();
     this.heartbeatInterval = setInterval(() => {
-        if (this.peer && !this.peer.destroyed && !this.peer.disconnected) {
-            // Socket heartbeat is handled by PeerJS usually, but we can verify connection
-        } else if (this.peer && this.peer.disconnected && !this.peer.destroyed) {
-            this.addLog('info', 'Heartbeat: Host disconnected, attempting reconnect...');
+        // Monitor PeerJS signaling connection
+        if (this.peer && this.peer.disconnected && !this.peer.destroyed) {
+            this.addLog('info', 'Signaling lost. Reconnecting...');
             this.peer.reconnect();
         }
-    }, 5000);
+    }, 3000); // Check more frequently
   }
 
   private stopHeartbeat() {
@@ -190,13 +186,11 @@ class GameService {
             return;
         }
 
-        // Vercel / Firewall Optimization: Force Port 443 and Secure
+        // Host configuration
         this.peer = new Peer(fullId, {
-            debug: 1,
+            debug: 1, // Reduced debug level to reduce console noise
             secure: true,
-            port: 443, 
-            config: { iceServers: ICE_SERVERS },
-            pingInterval: 5000, 
+            config: { iceServers: ICE_SERVERS }
         });
 
         this.peer.on('open', (id) => {
@@ -212,8 +206,11 @@ class GameService {
           conn.on('open', () => {
              this.addLog('success', `Student joined: ${conn.peer}`);
              this.connections.push(conn);
-             // Send current state immediately upon connection
-             conn.send({ type: 'SYNC_STATE', payload: this.state });
+             
+             // Small delay to ensure connection is stable before sending payload
+             setTimeout(() => {
+                 conn.send({ type: 'SYNC_STATE', payload: this.state });
+             }, 100);
           });
 
           conn.on('data', (data: any) => {
@@ -221,34 +218,34 @@ class GameService {
           });
           
           conn.on('close', () => {
-             this.addLog('info', `Student disconnected: ${conn.peer}`);
+             // this.addLog('info', `Student disconnected: ${conn.peer}`);
              this.connections = this.connections.filter(c => c !== conn);
           });
 
           conn.on('error', (err) => {
-             this.addLog('error', `Connection error with ${conn.peer}: ${err}`);
+             this.addLog('error', `Connection error with student: ${err}`);
           });
         });
 
         this.peer.on('error', (err) => {
-          this.addLog('error', `Host Peer Error: ${err.type} - ${err.message}`);
+          this.addLog('error', `Host Peer Error: ${err.type}`);
           
           if (err.type === 'unavailable-id') {
-             this.addLog('info', 'ID taken, assuming session restoration.');
+             this.addLog('info', 'ID taken, recovering session.');
              this.connectionStatus = 'connected';
              this.startHeartbeat();
              resolve(code);
              return;
           }
           
-          if (err.type === 'network' || err.type === 'server-error') {
+          if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
              this.connectionStatus = 'error';
           }
           resolve(code);
         });
 
         this.peer.on('disconnected', () => {
-            this.addLog('error', 'Host disconnected from signaling server. Auto-reconnecting...');
+            this.addLog('error', 'Host disconnected from cloud. Auto-reconnecting...');
             if (this.peer && !this.peer.destroyed) {
                 this.peer.reconnect();
             }
@@ -275,14 +272,13 @@ class GameService {
           
           const peer = new Peer({
               secure: true,
-              port: 443,
               config: { iceServers: ICE_SERVERS }
           });
           
           peer.on('open', (id) => {
-            this.addLog('info', `Client Peer ID generated. Connecting to ${fullId}...`);
+            this.addLog('info', `Client Peer ID generated. Connecting to Host...`);
             
-            // Connect to host
+            // Connect to host with lighter config for mobile
             const conn = peer.connect(fullId, { 
                 serialization: 'json',
                 metadata: { name: studentName }
@@ -323,7 +319,7 @@ class GameService {
                   this.addLog('error', 'Connection timed out. Firewalls may be blocking P2P.');
                   reject(new Error("Connection timed out."));
               }
-            }, 15000); // Increased timeout for cellular
+            }, 10000);
           });
 
           peer.on('error', (err) => {
@@ -419,7 +415,10 @@ class GameService {
       
       // Send specific command to clear client inputs
       if (this.isHost) {
+          // Send multiple times to ensure delivery over UDP/Mobile
           this.broadcast({ type: 'RESET_FORM' } as any);
+          setTimeout(() => this.broadcast({ type: 'RESET_FORM' } as any), 500);
+          setTimeout(() => this.broadcast({ type: 'RESET_FORM' } as any), 1000);
       }
   }
 
