@@ -39,6 +39,7 @@ class GameService {
   private isHost: boolean = false;
   public connectionStatus: ConnectionStatus = 'disconnected';
   private logs: LogEntry[] = [];
+  private heartbeatInterval: any = null;
 
   constructor() {
     // Try to load state from local storage for persistence across reloads (Teacher only)
@@ -131,6 +132,8 @@ class GameService {
 
   public async startNewClass(): Promise<string> {
     this.addLog('info', 'Starting new class...');
+    this.stopHeartbeat();
+    
     // 1. Disconnect existing peer
     if (this.peer) {
       this.peer.destroy();
@@ -147,6 +150,22 @@ class GameService {
 
     // 3. Start hosting again
     return this.startHosting();
+  }
+
+  private startHeartbeat() {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+        if (this.peer && !this.peer.destroyed && !this.peer.disconnected) {
+            // Socket heartbeat is handled by PeerJS usually, but we can verify connection
+        } else if (this.peer && this.peer.disconnected && !this.peer.destroyed) {
+            this.addLog('info', 'Heartbeat: Host disconnected, attempting reconnect...');
+            this.peer.reconnect();
+        }
+    }, 5000);
+  }
+
+  private stopHeartbeat() {
+      if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
   }
 
   public async startHosting(): Promise<string> {
@@ -166,19 +185,24 @@ class GameService {
         if (this.peer && !this.peer.destroyed) {
             this.addLog('info', 'Peer already active, reusing.');
             this.connectionStatus = 'connected';
+            this.startHeartbeat();
             resolve(code);
             return;
         }
 
+        // Vercel / Firewall Optimization: Force Port 443 and Secure
         this.peer = new Peer(fullId, {
             debug: 1,
             secure: true,
-            config: { iceServers: ICE_SERVERS }
+            port: 443, 
+            config: { iceServers: ICE_SERVERS },
+            pingInterval: 5000, 
         });
 
         this.peer.on('open', (id) => {
           this.addLog('success', `Host Online. ID: ${id}`);
           this.connectionStatus = 'connected';
+          this.startHeartbeat();
           resolve(code);
         });
 
@@ -212,16 +236,19 @@ class GameService {
           if (err.type === 'unavailable-id') {
              this.addLog('info', 'ID taken, assuming session restoration.');
              this.connectionStatus = 'connected';
+             this.startHeartbeat();
              resolve(code);
              return;
           }
           
-          this.connectionStatus = 'error';
+          if (err.type === 'network' || err.type === 'server-error') {
+             this.connectionStatus = 'error';
+          }
           resolve(code);
         });
 
         this.peer.on('disconnected', () => {
-            this.addLog('error', 'Host disconnected from signaling server. Attempting reconnect...');
+            this.addLog('error', 'Host disconnected from signaling server. Auto-reconnecting...');
             if (this.peer && !this.peer.destroyed) {
                 this.peer.reconnect();
             }
@@ -248,6 +275,7 @@ class GameService {
           
           const peer = new Peer({
               secure: true,
+              port: 443,
               config: { iceServers: ICE_SERVERS }
           });
           
@@ -275,6 +303,10 @@ class GameService {
                 this.state = msg.payload;
                 this.notifyListeners();
               }
+              // Handle Force Reset
+              if (msg.type === 'RESET_FORM') {
+                  this.notifyReset();
+              }
             });
 
             conn.on('close', () => {
@@ -291,7 +323,7 @@ class GameService {
                   this.addLog('error', 'Connection timed out. Firewalls may be blocking P2P.');
                   reject(new Error("Connection timed out."));
               }
-            }, 10000);
+            }, 15000); // Increased timeout for cellular
           });
 
           peer.on('error', (err) => {
@@ -332,6 +364,16 @@ class GameService {
            this.addLog('error', 'Cannot send answer: Disconnected');
        }
     }
+  }
+  
+  // Custom event for Reset
+  private resetListeners: (() => void)[] = [];
+  public subscribeReset(callback: () => void): () => void {
+      this.resetListeners.push(callback);
+      return () => { this.resetListeners = this.resetListeners.filter(l => l !== callback); };
+  }
+  private notifyReset() {
+      this.resetListeners.forEach(l => l());
   }
 
   // Internal Logic
@@ -374,6 +416,11 @@ class GameService {
           projectorDisplay: { type: 'prompt' }
       };
       this.persist();
+      
+      // Send specific command to clear client inputs
+      if (this.isHost) {
+          this.broadcast({ type: 'RESET_FORM' } as any);
+      }
   }
 
   public toggleAccepting(accepting: boolean) {

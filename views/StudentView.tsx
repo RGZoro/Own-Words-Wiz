@@ -19,6 +19,14 @@ export const StudentView: React.FC = () => {
     return backend.subscribe(setGameState);
   }, []);
 
+  // Listen for specific Reset events from teacher
+  useEffect(() => {
+    return backend.subscribeReset(() => {
+       setAnswer('');
+       setIsSubmitted(false);
+    });
+  }, []);
+
   // Effect: When teacher resets round (students object clears), reset local form
   useEffect(() => {
     const mySubmission = (Object.values(gameState.students) as StudentResponse[]).find(s => s.studentName === name);

@@ -32,4 +32,5 @@ export interface LogEntry {
 export type NetworkMessage = 
   | { type: 'SYNC_STATE'; payload: GameState }
   | { type: 'SUBMIT_ANSWER'; payload: { name: string; text: string } }
-  | { type: 'JOIN_REQUEST'; payload: { name: string } };
+  | { type: 'JOIN_REQUEST'; payload: { name: string } }
+  | { type: 'RESET_FORM' };
