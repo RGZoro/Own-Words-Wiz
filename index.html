@@ -4,6 +4,8 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Own Words Wiz</title>
+    <!-- We can keep the CDN for Tailwind for simplicity, or install it via PostCSS. 
+         Keeping CDN here ensures styles work without complex CSS setup. -->
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -23,16 +25,20 @@
   <script type="importmap">
 {
   "imports": {
-    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.1/",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.31.0",
     "react/": "https://aistudiocdn.com/react@^19.2.1/",
     "react": "https://aistudiocdn.com/react@^19.2.1",
-    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.31.0",
-    "peerjs": "https://esm.sh/peerjs@1.5.4?bundle-deps"
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.1/",
+    "vite": "https://aistudiocdn.com/vite@^7.2.6",
+    "@vitejs/plugin-react": "https://aistudiocdn.com/@vitejs/plugin-react@^5.1.1",
+    "peerjs": "https://aistudiocdn.com/peerjs@^1.5.5"
   }
 }
 </script>
 </head>
   <body>
     <div id="root"></div>
+    <!-- This script tag is essential for Vite to bundle and start the app -->
+    <script type="module" src="/index.tsx"></script>
   </body>
 </html>
