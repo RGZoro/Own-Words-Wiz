@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react';
 import { backend, ConnectionStatus } from '../services/mockBackend';
 import { GameState, StudentResponse } from '../types';
@@ -16,6 +15,7 @@ export const TeacherDashboard: React.FC = () => {
   const [grading, setGrading] = useState<Record<string, boolean>>({}); 
   const [internalProjectorOpen, setInternalProjectorOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
 
   useEffect(() => {
     // Start hosting immediately if not already hosting
@@ -43,6 +43,33 @@ export const TeacherDashboard: React.FC = () => {
         unsubscribe();
     };
   }, []); 
+
+  // Wake Lock for Teacher (Host) to prevent connection drop
+  useEffect(() => {
+    if ('wakeLock' in navigator) {
+      let wakeLock: any = null;
+      const requestWakeLock = async () => {
+        try {
+          wakeLock = await (navigator as any).wakeLock.request('screen');
+          console.log('Teacher Wake Lock active');
+        } catch (err) {
+          console.log('Teacher Wake Lock denied:', err);
+        }
+      };
+      requestWakeLock();
+      
+      const handleVisibilityChange = () => {
+        if (wakeLock !== null && document.visibilityState === 'visible') {
+          requestWakeLock();
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      return () => {
+        if (wakeLock) wakeLock.release();
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+    }
+  }, []);
 
   // Save API Key to LocalStorage whenever it changes
   useEffect(() => {
@@ -86,6 +113,14 @@ export const TeacherDashboard: React.FC = () => {
     setGrading(prev => ({ ...prev, [studentId]: false }));
   };
 
+  const handleNewClass = async () => {
+      if (confirm("Are you sure? This will disconnect everyone and generate a new code.")) {
+          setIsResetting(true);
+          await backend.startNewClass();
+          setIsResetting(false);
+      }
+  };
+
   const sortedStudents = (Object.values(gameState.students) as StudentResponse[]).sort((a, b) => b.submittedAt - a.submittedAt);
 
   if (internalProjectorOpen) {
@@ -107,7 +142,7 @@ export const TeacherDashboard: React.FC = () => {
             <div className="flex flex-col sm:flex-row sm:items-center gap-2">
                 <div className="flex items-center bg-gray-900 text-white px-4 py-2 rounded-lg shadow-sm">
                 <span className="text-xs text-gray-400 uppercase font-bold mr-2 tracking-wider">Class Code:</span>
-                {gameState.roomCode ? (
+                {gameState.roomCode && !isResetting ? (
                     <span className="text-xl font-mono font-bold tracking-widest text-green-400">{gameState.roomCode}</span>
                 ) : (
                     <span className="text-sm text-gray-400 animate-pulse">Generating...</span>
@@ -154,8 +189,8 @@ export const TeacherDashboard: React.FC = () => {
               </button>
             </div>
 
-            <Button variant="ghost" onClick={() => backend.resetGame()} className="text-red-500 hover:text-red-700 hover:bg-red-50">
-              Reset
+            <Button variant="ghost" onClick={handleNewClass} disabled={isResetting} className="text-red-500 hover:text-red-700 hover:bg-red-50">
+              New Class
             </Button>
           </div>
         </div>
@@ -192,11 +227,13 @@ export const TeacherDashboard: React.FC = () => {
               </div>
               
               <div className="bg-yellow-50 p-4 rounded-lg">
-                <h3 className="font-bold text-yellow-700 mb-2">3. Troubleshooting</h3>
-                <p className="text-sm">If students can't join:</p>
+                <h3 className="font-bold text-yellow-700 mb-2">3. Connectivity Issues</h3>
+                <p className="text-sm">If students can't join from 4G/Cellular:</p>
                 <ul className="list-disc ml-5 text-sm mt-2 space-y-1">
-                  <li>Ensure "Class Code" is visible and green.</li>
-                  <li>If it says "Offline Mode", the school network might be blocking WebRTC. Try using a mobile hotspot or guest Wi-Fi.</li>
+                  <li>The app uses free "Peer-to-Peer" technology.</li>
+                  <li>Strict networks (Cellular or School Firewalls) may block direct connections.</li>
+                  <li><strong>Fix:</strong> Connect both devices to the same WiFi (e.g., Guest WiFi or a Mobile Hotspot) for 100% reliability.</li>
+                  <li>Ensure this Teacher tab stays open and active (Wake Lock is enabled).</li>
                 </ul>
               </div>
             </div>

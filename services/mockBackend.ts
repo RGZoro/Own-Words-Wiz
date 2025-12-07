@@ -86,6 +86,25 @@ class GameService {
 
   // --- Networking: Teacher (Host) ---
 
+  public async startNewClass(): Promise<string> {
+    // 1. Disconnect existing peer
+    if (this.peer) {
+      this.peer.destroy();
+      this.peer = null;
+    }
+    this.connections = [];
+    
+    // 2. Clear room code in state so startHosting generates a new one
+    this.state = {
+      ...initialState,
+      roomCode: undefined, // Clear code
+    };
+    this.persist();
+
+    // 3. Start hosting again
+    return this.startHosting();
+  }
+
   public async startHosting(): Promise<string> {
     this.isHost = true;
     this.connectionStatus = 'connecting';
@@ -100,19 +119,33 @@ class GameService {
 
     return new Promise((resolve) => {
       try {
-        if (this.peer) this.peer.destroy();
+        if (this.peer && !this.peer.destroyed) {
+            console.log("Peer already exists, returning existing code");
+            this.connectionStatus = 'connected';
+            resolve(code);
+            return;
+        }
 
-        // 5 Second Timeout fallback
+        // 10 Second Timeout fallback (Increased from 5s)
         const timeoutId = setTimeout(() => {
           console.warn("PeerJS initialization timed out. Switching to Offline Mode.");
           this.connectionStatus = 'offline_mode';
           this.peer = null;
           resolve(code); 
-        }, 5000);
+        }, 10000);
 
         this.peer = new Peer(fullId, {
             debug: 1,
-            secure: true
+            // Explicitly use Google's STUN servers to improve connectivity on cellular/NATs
+            config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' },
+                    { urls: 'stun:stun2.l.google.com:19302' },
+                    { urls: 'stun:stun3.l.google.com:19302' },
+                    { urls: 'stun:stun4.l.google.com:19302' }
+                ]
+            }
         });
 
         this.peer.on('open', (id) => {
@@ -145,8 +178,12 @@ class GameService {
           console.error('Peer error:', err);
           
           if (err.type === 'unavailable-id') {
-             // If ID is taken, we might want to try a new code, but for now we fallback
-             // Real app might regen code here
+             // If ID is taken, it usually means we refreshed the page. 
+             // We can assume we "own" it or the previous session is still zombie on the server.
+             // We mark as connected but might have issues if the old one is truly active.
+             this.connectionStatus = 'connected';
+             resolve(code);
+             return;
           }
           
           // Fallback to offline mode on critical error
@@ -172,7 +209,15 @@ class GameService {
       try {
           if (this.peer) this.peer.destroy();
           
-          const peer = new Peer();
+          const peer = new Peer({
+              // Add STUN servers for client as well
+              config: {
+                iceServers: [
+                    { urls: 'stun:stun.l.google.com:19302' },
+                    { urls: 'stun:stun1.l.google.com:19302' }
+                ]
+            }
+          });
           
           peer.on('open', () => {
             const conn = peer.connect(fullId, { reliable: true });
@@ -194,18 +239,22 @@ class GameService {
 
             conn.on('error', (err) => {
               console.error("Connection Peer Error:", err);
-              reject(err);
+              // Don't reject immediately on transient errors
             });
             
-            // Timeout handling
+            // Timeout handling (Increased to 15s for cellular negotiation)
             setTimeout(() => {
-              if (!conn.open) reject(new Error("Connection timed out. Check code."));
-            }, 5000);
+              if (!conn.open) reject(new Error("Connection timed out. Check code or try different network."));
+            }, 15000);
           });
 
           peer.on('error', (err) => {
             console.error("Client Peer Error:", err);
-            reject(err);
+            if (err.type === 'peer-unavailable') {
+                reject(new Error("Class not found. Check code."));
+            } else {
+                reject(err);
+            }
           });
       } catch (e) {
           reject(e);
