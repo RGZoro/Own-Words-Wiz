@@ -1,17 +1,18 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
 export const evaluateAnswer = async (
-  apiKey: string,
   prompt: string,
   studentAnswer: string,
   maxScore: number = 2
 ): Promise<{ score: number; feedback: string }> => {
-  if (!apiKey) {
+  // Fix: Use process.env.API_KEY directly as required by guidelines
+  if (!process.env.API_KEY) {
     return { score: 0, feedback: "API Key missing. Cannot evaluate." };
   }
 
   try {
-    const ai = new GoogleGenAI({ apiKey });
+    // Fix: Initialize using the environment variable
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
     
     // We ask for a JSON response for structured data
     const response = await ai.models.generateContent({

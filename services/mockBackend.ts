@@ -1,11 +1,13 @@
 import { GameState, StudentResponse, NetworkMessage, LogEntry } from '../types';
 import { Peer, DataConnection } from 'peerjs';
+import { io, Socket } from 'socket.io-client';
 
 const STORAGE_KEY = 'own_words_wiz_state';
 const APP_PREFIX = 'oww-v1-';
+// Fix: Cast import.meta to any to resolve TS error
+const USE_WEBSOCKET = (import.meta as any).env?.VITE_USE_WEBSOCKET === 'true';
 
-// Simplified STUN list. Too many servers causes timeouts on mobile.
-// Google's STUN servers are the gold standard for free reliability.
+// Simplified STUN list.
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' }
@@ -24,29 +26,32 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 
 /**
  * GameService handles the game logic and networking.
+ * It now supports two transport modes: P2P (PeerJS) and Server (Socket.io)
  */
 class GameService {
   private state: GameState;
   private listeners: ((state: GameState) => void)[] = [];
   private logListeners: ((logs: LogEntry[]) => void)[] = [];
   
-  // PeerJS
+  // P2P (PeerJS) Variables
   private peer: Peer | null = null;
   private connections: DataConnection[] = [];
+  
+  // Server (Socket.io) Variables
+  private socket: Socket | null = null;
+  
   private isHost: boolean = false;
   public connectionStatus: ConnectionStatus = 'disconnected';
   private logs: LogEntry[] = [];
   private heartbeatInterval: any = null;
 
   constructor() {
-    // Try to load state from local storage for persistence across reloads (Teacher only)
     const saved = localStorage.getItem(STORAGE_KEY);
     this.state = saved ? JSON.parse(saved) : initialState;
 
-    // Listener for local tab sync (legacy/backup support)
+    // Legacy tab sync
     window.addEventListener('storage', (e) => {
       if (e.key === STORAGE_KEY && e.newValue) {
-        // Only merge if we are not the host, or if we are just starting up
         if (!this.isHost) {
            this.state = JSON.parse(e.newValue);
            this.notifyListeners();
@@ -54,7 +59,7 @@ class GameService {
       }
     });
     
-    this.addLog('info', 'Service initialized (v1.0.1)');
+    this.addLog('info', `Service initialized (v1.0.2) [Mode: ${USE_WEBSOCKET ? 'Docker/Server' : 'Peer-to-Peer'}]`);
   }
 
   // --- Logging ---
@@ -64,100 +69,85 @@ class GameService {
       type,
       message
     };
-    this.logs.unshift(entry); // Add to top
-    // Limit logs
+    this.logs.unshift(entry);
     if (this.logs.length > 200) this.logs = this.logs.slice(0, 200);
     this.logListeners.forEach(l => l([...this.logs]));
-    
     if (type === 'error') console.error(message);
     else console.log(`[${type.toUpperCase()}] ${message}`);
   }
 
-  public getLogs(): LogEntry[] {
-    return this.logs;
-  }
-
+  public getLogs(): LogEntry[] { return this.logs; }
   public subscribeLogs(callback: (logs: LogEntry[]) => void): () => void {
     this.logListeners.push(callback);
     callback([...this.logs]);
-    return () => {
-      this.logListeners = this.logListeners.filter(l => l !== callback);
-    };
+    return () => { this.logListeners = this.logListeners.filter(l => l !== callback); };
   }
 
   // --- State Management ---
-
-  public getState(): GameState {
-    return this.state;
-  }
-
+  public getState(): GameState { return this.state; }
   public subscribe(callback: (state: GameState) => void): () => void {
     this.listeners.push(callback);
     callback(this.state);
-    return () => {
-      this.listeners = this.listeners.filter((l) => l !== callback);
-    };
+    return () => { this.listeners = this.listeners.filter((l) => l !== callback); };
   }
 
   private persist() {
-    // Save to local storage
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
-    
-    // Broadcast to peers if we are host
     if (this.isHost) {
       this.broadcast({ type: 'SYNC_STATE', payload: this.state });
     }
-    
     this.notifyListeners();
   }
 
   private notifyListeners() {
-    // We send a shallow copy
     const stateCopy = { ...this.state };
     this.listeners.forEach((l) => l(stateCopy));
   }
 
+  // Unified Broadcast
   private broadcast(msg: NetworkMessage) {
-    this.connections.forEach(conn => {
-      if (conn.open) {
-        conn.send(msg);
-      }
-    });
+    if (USE_WEBSOCKET) {
+        // Socket.io Broadcast
+        if (this.socket && this.state.roomCode) {
+            this.socket.emit('message', { roomCode: this.state.roomCode, message: msg });
+        }
+    } else {
+        // PeerJS Broadcast
+        this.connections.forEach(conn => {
+            if (conn.open) conn.send(msg);
+        });
+    }
   }
 
-  // --- Networking: Teacher (Host) ---
+  // --- Networking: Start Host ---
 
   public async startNewClass(): Promise<string> {
     this.addLog('info', 'Starting new class...');
     this.stopHeartbeat();
     
-    // 1. Disconnect existing peer
-    if (this.peer) {
-      this.peer.destroy();
-      this.peer = null;
-    }
+    // Cleanup P2P
+    if (this.peer) { this.peer.destroy(); this.peer = null; }
     this.connections = [];
     
-    // 2. Clear room code in state
-    this.state = {
-      ...initialState,
-      roomCode: undefined, 
-    };
+    // Cleanup Socket
+    if (this.socket) { this.socket.disconnect(); this.socket = null; }
+    
+    this.state = { ...initialState, roomCode: undefined };
     this.persist();
 
-    // 3. Start hosting again
     return this.startHosting();
   }
 
   private startHeartbeat() {
     this.stopHeartbeat();
+    if (USE_WEBSOCKET) return; // WebSockets handle their own heartbeats
+    
     this.heartbeatInterval = setInterval(() => {
-        // Monitor PeerJS signaling connection
         if (this.peer && this.peer.disconnected && !this.peer.destroyed) {
             this.addLog('info', 'Signaling lost. Reconnecting...');
             this.peer.reconnect();
         }
-    }, 3000); // Check more frequently
+    }, 5000);
   }
 
   private stopHeartbeat() {
@@ -169,13 +159,84 @@ class GameService {
     this.connectionStatus = 'connecting';
     this.addLog('info', 'Initializing Host...');
     
-    // Reuse existing code if available, or generate new
     const code = this.state.roomCode || Math.random().toString(36).substring(2, 6).toUpperCase();
-    const fullId = APP_PREFIX + code;
-    
     this.state = { ...this.state, roomCode: code };
     this.persist();
 
+    if (USE_WEBSOCKET) {
+        return this.startHostingSocket(code);
+    } else {
+        return this.startHostingP2P(code);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // SOCKET.IO IMPLEMENTATION (Docker/NAS)
+  // --------------------------------------------------------------------------
+
+  private async startHostingSocket(code: string): Promise<string> {
+      return new Promise((resolve) => {
+          this.socket = io(); // Connects to relative path (server.js)
+          
+          this.socket.on('connect', () => {
+              this.addLog('success', `Host Connected via Server. Room: ${code}`);
+              this.connectionStatus = 'connected';
+              this.socket?.emit('join_room', code);
+              resolve(code);
+          });
+
+          this.socket.on('message', (data: any) => {
+              // As host, we receive answers
+              this.handleMessage(data);
+          });
+
+          this.socket.on('disconnect', () => {
+              this.addLog('error', 'Disconnected from server');
+              this.connectionStatus = 'error';
+          });
+      });
+  }
+
+  private async joinGameSocket(code: string, studentName: string): Promise<boolean> {
+      return new Promise((resolve, reject) => {
+          this.socket = io();
+          
+          this.socket.on('connect', () => {
+              this.addLog('success', 'Connected to Server');
+              this.socket?.emit('join_room', code);
+              
+              // Send join request
+              this.socket?.emit('message', { 
+                  roomCode: code, 
+                  message: { type: 'JOIN_REQUEST', payload: { name: studentName } } 
+              });
+              
+              // Wait a moment then resolve, as we don't get a direct ack from host in this simple version
+              setTimeout(() => resolve(true), 500);
+          });
+
+          this.socket.on('message', (msg: NetworkMessage) => {
+              if (msg.type === 'SYNC_STATE') {
+                this.state = msg.payload;
+                this.notifyListeners();
+              }
+              if (msg.type === 'RESET_FORM') {
+                  this.notifyReset();
+              }
+          });
+          
+          this.socket.on('connect_error', () => {
+             reject(new Error("Server connection failed"));
+          });
+      });
+  }
+
+  // --------------------------------------------------------------------------
+  // PEERJS IMPLEMENTATION (Vercel/Static)
+  // --------------------------------------------------------------------------
+
+  private async startHostingP2P(code: string): Promise<string> {
+    const fullId = APP_PREFIX + code;
     return new Promise((resolve) => {
       try {
         if (this.peer && !this.peer.destroyed) {
@@ -186,9 +247,8 @@ class GameService {
             return;
         }
 
-        // Host configuration
         this.peer = new Peer(fullId, {
-            debug: 1, // Reduced debug level to reduce console noise
+            debug: 1,
             secure: true,
             config: { iceServers: ICE_SERVERS }
         });
@@ -201,94 +261,58 @@ class GameService {
         });
 
         this.peer.on('connection', (conn) => {
-          this.addLog('info', `Student connecting: ${conn.peer}`);
-          
+          this.addLog('info', `Student connecting...`);
           conn.on('open', () => {
-             this.addLog('success', `Student joined: ${conn.peer}`);
+             this.addLog('success', `Student joined!`);
              this.connections.push(conn);
-             
-             // Small delay to ensure connection is stable before sending payload
              setTimeout(() => {
                  conn.send({ type: 'SYNC_STATE', payload: this.state });
              }, 100);
           });
-
-          conn.on('data', (data: any) => {
-            this.handleMessage(data);
-          });
-          
+          conn.on('data', (data: any) => this.handleMessage(data));
           conn.on('close', () => {
-             // this.addLog('info', `Student disconnected: ${conn.peer}`);
              this.connections = this.connections.filter(c => c !== conn);
-          });
-
-          conn.on('error', (err) => {
-             this.addLog('error', `Connection error with student: ${err}`);
           });
         });
 
         this.peer.on('error', (err) => {
           this.addLog('error', `Host Peer Error: ${err.type}`);
-          
           if (err.type === 'unavailable-id') {
-             this.addLog('info', 'ID taken, recovering session.');
              this.connectionStatus = 'connected';
              this.startHeartbeat();
-             resolve(code);
-             return;
-          }
-          
-          if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+          } else {
              this.connectionStatus = 'error';
           }
           resolve(code);
         });
-
+        
         this.peer.on('disconnected', () => {
-            this.addLog('error', 'Host disconnected from cloud. Auto-reconnecting...');
-            if (this.peer && !this.peer.destroyed) {
-                this.peer.reconnect();
-            }
+             if (this.peer && !this.peer.destroyed) this.peer.reconnect();
         });
 
       } catch (e: any) {
-        this.addLog('error', `Exception in startHosting: ${e.message}`);
+        this.addLog('error', `Exception: ${e.message}`);
         this.connectionStatus = 'error';
         resolve(code);
       }
     });
   }
 
-  // --- Networking: Student (Client) ---
-
-  public async joinGame(code: string, studentName: string): Promise<boolean> {
-    this.isHost = false;
+  private async joinGameP2P(code: string, studentName: string): Promise<boolean> {
     const fullId = APP_PREFIX + code.toUpperCase();
-    this.addLog('info', `Attempting to join room: ${code}`);
-
     return new Promise((resolve, reject) => {
       try {
           if (this.peer) this.peer.destroy();
+          const peer = new Peer({ secure: true, config: { iceServers: ICE_SERVERS } });
           
-          const peer = new Peer({
-              secure: true,
-              config: { iceServers: ICE_SERVERS }
-          });
-          
-          peer.on('open', (id) => {
-            this.addLog('info', `Client Peer ID generated. Connecting to Host...`);
-            
-            // Connect to host with lighter config for mobile
-            const conn = peer.connect(fullId, { 
-                serialization: 'json',
-                metadata: { name: studentName }
-            });
+          peer.on('open', () => {
+            this.addLog('info', `Connecting to Host...`);
+            const conn = peer.connect(fullId, { serialization: 'json' });
             
             conn.on('open', () => {
               this.addLog('success', 'Connected to Teacher!');
               this.peer = peer;
               this.connections = [conn];
-              // Send join request immediately
               conn.send({ type: 'JOIN_REQUEST', payload: { name: studentName } });
               resolve(true);
             });
@@ -299,189 +323,124 @@ class GameService {
                 this.state = msg.payload;
                 this.notifyListeners();
               }
-              // Handle Force Reset
-              if (msg.type === 'RESET_FORM') {
-                  this.notifyReset();
-              }
+              if (msg.type === 'RESET_FORM') this.notifyReset();
             });
 
-            conn.on('close', () => {
-                this.addLog('error', 'Disconnected from Teacher.');
-            });
-
-            conn.on('error', (err) => {
-              this.addLog('error', `Conn Error: ${err}`);
-            });
-            
-            // Timeout safety
             setTimeout(() => {
-              if (!conn.open) {
-                  this.addLog('error', 'Connection timed out. Firewalls may be blocking P2P.');
-                  reject(new Error("Connection timed out."));
-              }
+              if (!conn.open) reject(new Error("Connection timed out."));
             }, 10000);
           });
 
           peer.on('error', (err) => {
-            this.addLog('error', `Client Peer Error: ${err.type}`);
-            if (err.type === 'peer-unavailable') {
-                reject(new Error("Class not found. Check code."));
-            } else {
-                reject(err);
-            }
+             reject(err);
           });
       } catch (e: any) {
-          this.addLog('error', `Join Exception: ${e.message}`);
           reject(e);
       }
     });
   }
 
-  private handleMessage(msg: NetworkMessage) {
-    if (!this.isHost) return;
+  // --- Common Logic ---
 
-    if (msg.type === 'SUBMIT_ANSWER') {
-      const { name, text } = msg.payload;
-      this.addLog('info', `Received answer from ${name}`);
-      this.addAnswerInternal(name, text);
+  public async joinGame(code: string, studentName: string): Promise<boolean> {
+    this.isHost = false;
+    this.addLog('info', `Joining room: ${code}`);
+
+    if (USE_WEBSOCKET) {
+        return this.joinGameSocket(code, studentName);
+    } else {
+        return this.joinGameP2P(code, studentName);
     }
   }
 
-  // --- Actions ---
+  private handleMessage(msg: NetworkMessage) {
+    if (!this.isHost) return;
+    if (msg.type === 'SUBMIT_ANSWER') {
+      const { name, text } = msg.payload;
+      this.addAnswerInternal(name, text);
+    }
+  }
 
   // Called by Student View
   public sendAnswer(studentName: string, text: string) {
     if (this.isHost) {
        this.addAnswerInternal(studentName, text);
     } else {
-       if (this.connections[0]?.open) {
-         this.connections[0].send({ type: 'SUBMIT_ANSWER', payload: { name: studentName, text } });
+       if (USE_WEBSOCKET) {
+           if (this.socket && this.state.roomCode) {
+               this.socket.emit('message', { 
+                   roomCode: this.state.roomCode, 
+                   message: { type: 'SUBMIT_ANSWER', payload: { name: studentName, text } } 
+               });
+           }
        } else {
-           this.addLog('error', 'Cannot send answer: Disconnected');
+           if (this.connections[0]?.open) {
+             this.connections[0].send({ type: 'SUBMIT_ANSWER', payload: { name: studentName, text } });
+           }
        }
     }
   }
   
-  // Custom event for Reset
   private resetListeners: (() => void)[] = [];
   public subscribeReset(callback: () => void): () => void {
       this.resetListeners.push(callback);
       return () => { this.resetListeners = this.resetListeners.filter(l => l !== callback); };
   }
-  private notifyReset() {
-      this.resetListeners.forEach(l => l());
-  }
+  private notifyReset() { this.resetListeners.forEach(l => l()); }
 
-  // Internal Logic
   private addAnswerInternal(studentName: string, text: string) {
-    const id = studentName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
+    const id = studentName.toLowerCase().replace(/[^a-z0-9]/g, '-') + '-' + Date.now();
     const response: StudentResponse = {
-      id,
-      studentName,
-      text,
-      submittedAt: Date.now(),
-      score: null,
+      id, studentName, text, submittedAt: Date.now(), score: null,
     };
-    // Immutable update
     this.state = {
       ...this.state,
       students: { ...this.state.students, [id]: response }
     };
     this.persist();
-    return id;
   }
 
   // Teacher Actions
   public setPrompt(prompt: string, maxScore: number = 2) {
-    this.state = {
-        ...this.state,
-        prompt,
-        maxScore,
-        isAcceptingAnswers: true,
-        projectorDisplay: { type: 'prompt' }
-    };
+    this.state = { ...this.state, prompt, maxScore, isAcceptingAnswers: true, projectorDisplay: { type: 'prompt' } };
     this.persist();
   }
 
   public resetRound() {
-      this.addLog('info', 'Resetting round (clearing answers).');
-      this.state = {
-          ...this.state,
-          students: {}, // Clear all answers
-          isAcceptingAnswers: true,
-          projectorDisplay: { type: 'prompt' }
-      };
+      this.addLog('info', 'Resetting round.');
+      this.state = { ...this.state, students: {}, isAcceptingAnswers: true, projectorDisplay: { type: 'prompt' } };
       this.persist();
       
-      // Send specific command to clear client inputs
       if (this.isHost) {
-          // Send multiple times to ensure delivery over UDP/Mobile
           this.broadcast({ type: 'RESET_FORM' } as any);
-          setTimeout(() => this.broadcast({ type: 'RESET_FORM' } as any), 500);
-          setTimeout(() => this.broadcast({ type: 'RESET_FORM' } as any), 1000);
+          if (!USE_WEBSOCKET) {
+            // Repeat for UDP reliability if using P2P
+            setTimeout(() => this.broadcast({ type: 'RESET_FORM' } as any), 500);
+          }
       }
   }
 
-  public toggleAccepting(accepting: boolean) {
-    this.state = { ...this.state, isAcceptingAnswers: accepting };
-    this.persist();
-  }
-
   public setProjectorView(type: 'prompt' | 'answer', answerId?: string) {
-    this.state = { 
-        ...this.state, 
-        projectorDisplay: { type, contentId: answerId } 
-    };
+    this.state = { ...this.state, projectorDisplay: { type, contentId: answerId } };
     this.persist();
   }
 
   public updateStudentScore(id: string, score: number) {
     if (this.state.students[id]) {
-      this.state = {
-          ...this.state,
-          students: {
-              ...this.state.students,
-              [id]: { ...this.state.students[id], score }
-          }
-      };
+      this.state = { ...this.state, students: { ...this.state.students, [id]: { ...this.state.students[id], score } } };
       this.persist();
     }
   }
 
   public updateStudentAiData(id: string, score: number, feedback: string) {
     if (this.state.students[id]) {
-       this.state = {
-          ...this.state,
-          students: {
-              ...this.state.students,
-              [id]: { ...this.state.students[id], aiSuggestedScore: score, aiFeedback: feedback }
-          }
-       };
+       this.state = { ...this.state, students: { ...this.state.students, [id]: { ...this.state.students[id], aiSuggestedScore: score, aiFeedback: feedback } } };
       this.persist();
     }
   }
   
   public addDemoStudents() {
-    const demos = [
-      { name: "Sarah J.", text: "The writer conveys the intensity by using the word 'battered' to describe the wind against the walls." },
-      { name: "Mike T.", text: "It was very windy and loud outside." },
-      { name: "David L.", text: "The text says 'the wind battered the walls' which shows it was strong." },
-      { name: "Emma W.", text: "By using the metaphor of a 'wild beast', the writer suggests the storm was uncontrollable." }
-    ];
-
-    demos.forEach((d) => {
-      this.addAnswerInternal(d.name, d.text);
-    });
-  }
-
-  public resetGame() {
-    const code = this.state.roomCode; 
-    this.state = { 
-        ...initialState, 
-        roomCode: code, 
-        students: {} 
-    };
-    this.persist();
+    ["Sarah J.", "Mike T.", "David L."].forEach((n) => this.addAnswerInternal(n, "Demo answer text."));
   }
 }
 

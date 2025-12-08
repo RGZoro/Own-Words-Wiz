@@ -10,7 +10,7 @@ export const TeacherDashboard: React.FC = () => {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>(backend.connectionStatus);
   const [newPrompt, setNewPrompt] = useState('');
   const [newMaxScore, setNewMaxScore] = useState(2);
-  const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_api_key') || process.env.API_KEY || '');
+  // Fix: Removed apiKey state
   const [grading, setGrading] = useState<Record<string, boolean>>({}); 
   const [internalProjectorOpen, setInternalProjectorOpen] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
@@ -63,10 +63,6 @@ export const TeacherDashboard: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => {
-    if (apiKey) localStorage.setItem('gemini_api_key', apiKey);
-  }, [apiKey]);
-
   const handleLaunchProjectorPopup = () => {
     const width = 1024;
     const height = 768;
@@ -100,12 +96,9 @@ export const TeacherDashboard: React.FC = () => {
   };
 
   const handleAiGrade = async (studentId: string, answer: string) => {
-    if (!apiKey) {
-      alert("Please enter a Gemini API Key in the settings first.");
-      return;
-    }
+    // Fix: Removed apiKey check and passed parameter
     setGrading(prev => ({ ...prev, [studentId]: true }));
-    const result = await evaluateAnswer(apiKey, gameState.prompt, answer, gameState.maxScore);
+    const result = await evaluateAnswer(gameState.prompt, answer, gameState.maxScore);
     backend.updateStudentAiData(studentId, result.score, result.feedback);
     setGrading(prev => ({ ...prev, [studentId]: false }));
   };
@@ -148,13 +141,7 @@ export const TeacherDashboard: React.FC = () => {
           </div>
 
           <div className="flex items-center gap-3 overflow-x-auto">
-             <input 
-              type="password" 
-              placeholder="Gemini API Key" 
-              value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
-              className="border border-gray-300 rounded px-2 py-1 text-sm w-32 md:w-40 focus:ring-indigo-500 focus:border-indigo-500"
-            />
+             {/* Fix: Removed API Key input */}
              <Button variant="ghost" onClick={() => setShowHelp(true)} className="text-gray-500 hover:text-indigo-600 px-2">
               ?
             </Button>
